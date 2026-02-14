@@ -1,0 +1,105 @@
+pragma cashscript ^0.12.0;
+
+// =============================================================================
+// DutchAuctionSwap — Same-chain CashToken intent swap with Dutch Auction pricing
+// =============================================================================
+//
+// Mirrors the Movement `intent-swap` flow:
+//   - User (maker) locks sell-tokens in this covenant
+//   - Resolver fills the order by providing buy-tokens at the current auction price
+//   - Price decays linearly from `startBuyAmount` down to `endBuyAmount` over time
+//
+// Constructor params are baked into the contract address (like Move constructor args).
+
+contract DutchAuctionSwap(
+    // Maker's public key hash (recipient of buy-tokens)
+    bytes20 makerPkh,
+    // Token category of the sell token (bytes32, 0x for native BCH)
+    bytes sellTokenCategory,
+    // Token category of the buy token (bytes32, 0x for native BCH)
+    bytes buyTokenCategory,
+    // Amount of sell tokens locked in this covenant
+    int sellAmount,
+    // Dutch Auction: starting (maximum) buy price
+    int startBuyAmount,
+    // Dutch Auction: ending (minimum) buy price
+    int endBuyAmount,
+    // Unix timestamp when auction starts
+    int startTime,
+    // Duration of the auction in seconds
+    int duration
+) {
+    // =========================================================================
+    // fill() — Resolver fills the order at the current Dutch Auction price
+    // =========================================================================
+    //
+    // The resolver must construct a transaction where:
+    //   Output 0: Sends >= currentPrice of buyToken to the maker
+    //   Output 1: Sends sellAmount of sellToken to the resolver
+    //
+    function fill(pubkey resolverPk, sig resolverSig) {
+        // Verify resolver's signature
+        require(checkSig(resolverSig, resolverPk));
+
+        // --- Dutch Auction Price Calculation ---
+        // Use tx.locktime as the "current time" for the auction
+        int currentTime = tx.locktime;
+
+        // Must be after auction start
+        require(currentTime >= startTime);
+
+        // Calculate current price using linear decay
+        // Linear decay: price = start - (start - end) * min(elapsed, duration) / duration
+        // Using min() ensures we clamp at endBuyAmount after auction ends
+        int elapsed = currentTime - startTime;
+        int clampedElapsed = min(elapsed, duration);
+        int priceDrop = startBuyAmount - endBuyAmount;
+        int dropAmount = (priceDrop * clampedElapsed) / duration;
+        int currentPrice = startBuyAmount - dropAmount;
+
+        // --- Covenant: Enforce output constraints ---
+
+        // Output 0: Must send >= currentPrice to the maker
+        bytes25 makerLockingBytecode = new LockingBytecodeP2PKH(makerPkh);
+        require(tx.outputs[0].lockingBytecode == makerLockingBytecode);
+
+        // Check if buy token is native BCH or a CashToken
+        if (buyTokenCategory == 0x) {
+            // Native BCH: check satoshi value
+            require(tx.outputs[0].value >= currentPrice);
+        } else {
+            // CashToken: check token category and amount
+            require(tx.outputs[0].tokenCategory == buyTokenCategory);
+            require(tx.outputs[0].tokenAmount >= currentPrice);
+            // Must have dust amount of BCH too
+            require(tx.outputs[0].value >= 1000);
+        }
+
+        // Output 1: Must send sell tokens to the resolver
+        bytes20 resolverPkh = hash160(resolverPk);
+        bytes25 resolverLockingBytecode = new LockingBytecodeP2PKH(resolverPkh);
+        require(tx.outputs[1].lockingBytecode == resolverLockingBytecode);
+
+        if (sellTokenCategory == 0x) {
+            // Native BCH
+            require(tx.outputs[1].value >= sellAmount);
+        } else {
+            // CashToken
+            require(tx.outputs[1].tokenCategory == sellTokenCategory);
+            require(tx.outputs[1].tokenAmount >= sellAmount);
+        }
+    }
+
+    // =========================================================================
+    // cancel() — Maker cancels the order and reclaims funds after auction ends
+    // =========================================================================
+    function cancel(pubkey makerPk, sig makerSig) {
+        // Verify it's the maker
+        require(hash160(makerPk) == makerPkh);
+        require(checkSig(makerSig, makerPk));
+
+        // Can only cancel after the auction duration has fully elapsed
+        int endTime = startTime + duration;
+        require(tx.time >= endTime);
+    }
+}

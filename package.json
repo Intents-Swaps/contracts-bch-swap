@@ -1,0 +1,20 @@
+{
+  "name": "intent-protocol-bch-swap",
+  "version": "1.0.0",
+  "description": "Same-chain BCH/CashToken intent swaps using Dutch Auction and Limit Order contracts",
+  "type": "module",
+  "scripts": {
+    "build": "cashc contracts/DutchAuctionSwap.cash -o artifacts/DutchAuctionSwap.json && cashc contracts/LimitOrderSwap.cash -o artifacts/LimitOrderSwap.json",
+    "test": "tsx test/DutchAuctionSwap.test.ts",
+    "test:limit": "tsx test/LimitOrderSwap.test.ts",
+    "test:all": "tsx test/DutchAuctionSwap.test.ts && tsx test/LimitOrderSwap.test.ts"
+  },
+  "dependencies": {
+    "cashscript": "^0.10.0",
+    "electrum-cash": "^2.0.10"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}

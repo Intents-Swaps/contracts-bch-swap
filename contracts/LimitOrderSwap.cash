@@ -1,0 +1,74 @@
+pragma cashscript ^0.12.0;
+
+// =============================================================================
+// LimitOrderSwap — Fixed-price CashToken swap (mirrors limit_order.move)
+// =============================================================================
+//
+// Simpler than Dutch Auction: The maker specifies an exact price.
+// Resolver must provide exactly `buyAmount` of `buyToken` to the maker.
+
+contract LimitOrderSwap(
+    // Maker's public key hash (recipient of buy-tokens)
+    bytes20 makerPkh,
+    // Token category of the sell token (bytes32, 0x for native BCH)
+    bytes sellTokenCategory,
+    // Token category of the buy token (bytes32, 0x for native BCH)
+    bytes buyTokenCategory,
+    // Amount of sell tokens locked
+    int sellAmount,
+    // Fixed buy amount required
+    int buyAmount,
+    // Expiry time (unix timestamp) — order is invalid after this
+    int expiryTime
+) {
+    // =========================================================================
+    // fill() — Resolver fills the limit order at the fixed price
+    // =========================================================================
+    function fill(pubkey resolverPk, sig resolverSig) {
+        // Verify resolver's signature
+        require(checkSig(resolverSig, resolverPk));
+
+        // Must be before expiry
+        int currentTime = tx.locktime;
+        require(currentTime < expiryTime);
+
+        // --- Covenant: Enforce output constraints ---
+
+        // Output 0: Must send exactly buyAmount to the maker
+        bytes25 makerLockingBytecode = new LockingBytecodeP2PKH(makerPkh);
+        require(tx.outputs[0].lockingBytecode == makerLockingBytecode);
+
+        if (buyTokenCategory == 0x) {
+            // Native BCH
+            require(tx.outputs[0].value >= buyAmount);
+        } else {
+            // CashToken
+            require(tx.outputs[0].tokenCategory == buyTokenCategory);
+            require(tx.outputs[0].tokenAmount >= buyAmount);
+            require(tx.outputs[0].value >= 1000);
+        }
+
+        // Output 1: Must send sell tokens to the resolver
+        bytes20 resolverPkh = hash160(resolverPk);
+        bytes25 resolverLockingBytecode = new LockingBytecodeP2PKH(resolverPkh);
+        require(tx.outputs[1].lockingBytecode == resolverLockingBytecode);
+
+        if (sellTokenCategory == 0x) {
+            require(tx.outputs[1].value >= sellAmount);
+        } else {
+            require(tx.outputs[1].tokenCategory == sellTokenCategory);
+            require(tx.outputs[1].tokenAmount >= sellAmount);
+        }
+    }
+
+    // =========================================================================
+    // cancel() — Maker cancels and reclaims funds after expiry
+    // =========================================================================
+    function cancel(pubkey makerPk, sig makerSig) {
+        require(hash160(makerPk) == makerPkh);
+        require(checkSig(makerSig, makerPk));
+
+        // Can only cancel after expiry
+        require(tx.time >= expiryTime);
+    }
+}
