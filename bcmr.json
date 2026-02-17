@@ -1,0 +1,44 @@
+{
+    "$schema": "https://cashtokens.org/bcmr-v2.schema.json",
+    "version": {
+        "major": 1,
+        "minor": 0,
+        "patch": 0
+    },
+    "latestRevision": "2026-02-17T00:00:00.000Z",
+    "registryIdentity": {
+        "name": "Intent Protocol Testnet Registry",
+        "description": "Metadata for Intent Protocol demo tokens on BCH Chipnet",
+        "uris": {
+            "icon": "https://github.com/Intents-Swaps/contracts-bch-swap/raw/main/assets/icon.png",
+            "web": "https://intent-protocol.demo",
+            "registry": "https://github.com/Intents-Swaps/contracts-bch-swap/raw/main/bcmr.json"
+        }
+    },
+    "identities": {
+        "8a70a0a814108e7a26d132838dc5152e431394002c30440b75d15246dbb924df": {
+            "name": "Move Token (Bridged)",
+            "description": "Bridged Movement Token via Intent Protocol",
+            "token": {
+                "category": "8a70a0a814108e7a26d132838dc5152e431394002c30440b75d15246dbb924df",
+                "symbol": "MOVE",
+                "decimals": 8,
+                "uris": {
+                    "icon": "https://github.com/Intents-Swaps/contracts-bch-swap/raw/main/assets/move-icon.png"
+                }
+            }
+        },
+        "d18f92ae2732ab773ad2006f15712530c3365319806307770857f128c7c25b30": {
+            "name": "Solana Token (Bridged)",
+            "description": "Bridged Solana Token via Intent Protocol",
+            "token": {
+                "category": "d18f92ae2732ab773ad2006f15712530c3365319806307770857f128c7c25b30",
+                "symbol": "SOL",
+                "decimals": 9,
+                "uris": {
+                    "icon": "https://github.com/Intents-Swaps/contracts-bch-swap/raw/main/assets/sol-icon.png"
+                }
+            }
+        }
+    }
+}
