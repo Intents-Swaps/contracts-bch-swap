@@ -11,9 +11,12 @@
   },
   "dependencies": {
     "cashscript": "^0.10.0",
-    "electrum-cash": "^2.0.10"
+    "electrum-cash": "^2.0.10",
+    "mainnet-js": "^3.1.7"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "qrcode": "^1.5.4",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   }

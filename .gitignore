@@ -3,3 +3,5 @@ dist/
 artifacts/
 .env
 nul
+wallet.json
+*.log
