@@ -4,13 +4,15 @@
   "description": "Same-chain BCH/CashToken intent swaps using Dutch Auction and Limit Order contracts",
   "type": "module",
   "scripts": {
-    "build": "cashc contracts/DutchAuctionSwap.cash -o artifacts/DutchAuctionSwap.json && cashc contracts/LimitOrderSwap.cash -o artifacts/LimitOrderSwap.json",
+    "build": "npx cashc contracts/DutchAuctionSwap.cash -o artifacts/DutchAuctionSwap.json && npx cashc contracts/LimitOrderSwap.cash -o artifacts/LimitOrderSwap.json",
+    "test:e2e": "tsx test/e2e_dutch_auction.ts",
     "test": "tsx test/DutchAuctionSwap.test.ts",
     "test:limit": "tsx test/LimitOrderSwap.test.ts",
     "test:all": "tsx test/DutchAuctionSwap.test.ts && tsx test/LimitOrderSwap.test.ts"
   },
   "dependencies": {
-    "cashscript": "^0.10.0",
+    "@cashlab/cauldron": "^1.0.2",
+    "cashscript": "^0.12.0",
     "electrum-cash": "^2.0.10",
     "mainnet-js": "^3.1.7"
   },

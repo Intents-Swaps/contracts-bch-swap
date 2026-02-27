@@ -4,7 +4,6 @@ pragma cashscript ^0.12.0;
 // DutchAuctionSwap — Same-chain CashToken intent swap with Dutch Auction pricing
 // =============================================================================
 //
-// Mirrors the Movement `intent-swap` flow:
 //   - User (maker) locks sell-tokens in this covenant
 //   - Resolver fills the order by providing buy-tokens at the current auction price
 //   - Price decays linearly from `startBuyAmount` down to `endBuyAmount` over time
