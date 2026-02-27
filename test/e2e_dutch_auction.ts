@@ -2,7 +2,10 @@ import {
     Contract,
     ElectrumNetworkProvider,
     SignatureTemplate,
+    TransactionBuilder,
 } from 'cashscript';
+import { createHash } from 'crypto';
+import { decodeTransaction, hexToBin, binToHex, cashAddressToLockingBytecode } from '@bitauth/libauth';
 import { TestNetWallet, Config } from 'mainnet-js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -15,9 +18,12 @@ const WALLET_FILE = 'wallet.json';
 const TOKEN_DATA_FILE = 'token-data.json';
 const ARTIFACT_FILE = path.resolve('artifacts/DutchAuctionSwap.json');
 
+// Reverse hex for Little-Endian (wire format for introspection opcodes)
+const reverseHex = (hex: string) => hex.match(/.{2}/g)!.reverse().join('');
+
 async function main() {
     console.log("=== Starting E2E Dutch Auction Test on Chipnet ===");
-    console.log("DEBUG: VERSION 3 - WITH WALLET FUNDING");
+    console.log("VERSION 4 - CashScript v0.12 TransactionBuilder API");
 
     // 1. Load Wallet
     if (!fs.existsSync(WALLET_FILE)) {
@@ -31,11 +37,8 @@ async function main() {
     console.log(`Token Address: ${tokenAddr}`);
 
     // 2. Load Token Data
-    if (!fs.existsSync(TOKEN_DATA_FILE)) {
-        throw new Error("Token data not found. Run 'npm run mint-musd' first.");
-    }
-    const tokenData = JSON.parse(fs.readFileSync(TOKEN_DATA_FILE, 'utf8'));
-    const categoryId = tokenData.musd;
+    // We must use a token category the wallet actually possesses, otherwise mainnet-js silently ignores it
+    const categoryId = "b4863d5773c7a269b6fe3b9f7ce2ce1098ab71c0b046ef2a39058d5e30b1f353";
     console.log(`Token Category: ${categoryId}`);
 
     // 3. Load Artifact
@@ -46,14 +49,66 @@ async function main() {
     const artifact = JSON.parse(fs.readFileSync(ARTIFACT_FILE, 'utf8'));
 
     // 4. Initialize Contract
+    // Note: Reverse category ID to Little-Endian for introspection opcode matching
     const makerPkh = await (wallet as any).getPublicKeyHash();
-
-    const sellTokenCategory = `0x${categoryId}`;
+    const sellTokenCategoryLE = `0x${reverseHex(categoryId)}`;
     const buyTokenCategory = '0x'; // Native BCH
     const sellAmount = 1000n;
 
-    const startBuyAmount = 5000n;
-    const endBuyAmount = 1000n;
+    // 6. Integrate Cauldron DEX Oracle (Fetch Price)
+    console.log("\n--- Fetching Oracle Price from Cauldron DEX ---");
+    let tokenPriceSats = 0; // Price of 1 token in satoshis (from price_now)
+    let tokenPriceUsd = 0;
+    let oracleFound = false;
+    try {
+        const response = await fetch(`https://indexer-chipnet.riften.net/cauldron/tokens/search_cached?q=${categoryId}`);
+        if (response.ok) {
+            const data = await response.json();
+            const tokenInfo = Array.isArray(data) ? data[0] : data;
+            if (tokenInfo) {
+                console.log(`  Token Name: ${tokenInfo.display_name || 'Unknown'}`);
+                console.log(`  Symbol: ${tokenInfo.display_symbol || 'N/A'}`);
+                console.log(`  Price (BCH): ${tokenInfo.price_now} sats/token`);
+                console.log(`  Price (USD): $${tokenInfo.price_now_usd}`);
+                console.log(`  TVL: ${tokenInfo.tvl_sats} sats / ${tokenInfo.tvl_tokens} tokens`);
+                console.log(`  Trade Volume: ${tokenInfo.trade_volume} sats`);
+                if (tokenInfo.price_now && tokenInfo.price_now > 0) {
+                    tokenPriceSats = tokenInfo.price_now;
+                    tokenPriceUsd = tokenInfo.price_now_usd || 0;
+                    oracleFound = true;
+                }
+            }
+        }
+    } catch (e) {
+        console.log("Failed to fetch from Cauldron Oracle:", e);
+    }
+
+    // Calculate how many sats 1000 tokens are worth using the BCH price directly
+    // price_now is sats per token (e.g. 0.48 sats/token)
+    // For 1000 tokens: 1000 * 0.48 = 480 sats total
+    let equivalentSats: bigint;
+    if (oracleFound && tokenPriceSats > 0) {
+        // price_now is in sats (can be fractional), multiply by sellAmount
+        equivalentSats = BigInt(Math.ceil(1000 * tokenPriceSats));
+        console.log(`\n  Oracle Price: ${tokenPriceSats} sats/token`);
+        console.log(`  1000 tokens = ${equivalentSats} sats`);
+    } else {
+        // Fallback: use a reasonable test value
+        equivalentSats = 5000n;
+        console.log(`  No oracle price. Using fallback: ${equivalentSats} sats`);
+    }
+
+    // The starting amount is a 10% premium over spot price (maker wants more)
+    const startBuyAmount = equivalentSats + (equivalentSats * 10n / 100n);
+    // The ending amount is a 10% discount under spot price (maker accepts less over time)
+    const endBuyAmount = equivalentSats - (equivalentSats * 10n / 100n);
+
+    // Ensure we don't go below absolute dust limit (546 sats)
+    const safeStartBuyAmount = startBuyAmount < 1000n ? 2000n : startBuyAmount;
+    const safeEndBuyAmount = endBuyAmount < 546n ? 1000n : endBuyAmount;
+
+    console.log(`\n  Dutch Auction Range: ${safeStartBuyAmount} sats (start) → ${safeEndBuyAmount} sats (end)`);
+
     const duration = 600n;
     const startTime = BigInt(Math.floor(Date.now() / 1000)); // Now
 
@@ -61,115 +116,193 @@ async function main() {
 
     const contract = new Contract(artifact, [
         makerPkh,
-        sellTokenCategory,
+        sellTokenCategoryLE,  // Little-Endian for introspection
         buyTokenCategory,
         sellAmount,
-        startBuyAmount,
-        endBuyAmount,
+        safeStartBuyAmount,
+        safeEndBuyAmount,
         startTime,
         duration
     ], { provider });
 
     console.log(`Contract Address: ${contract.address}`);
+    console.log(`Contract Token Address: ${contract.tokenAddress}`);
     console.log(`Contract Size: ${contract.bytesize} bytes`);
     console.log(`Contract Opcount: ${contract.opcount} ops`);
 
-    // 5. Fund the Contract (Lock 1000 MUSD)
+    // 5. Fund the Contract (Lock 1000 tokens)
     console.log("\n--- Funding Contract ---");
-    const fundAmount = 1000n; // 1000 tokens
+    const fundAmount = 1000n;
 
+    // Construct the contract UTXO directly from the funding TX we just created.
+    // The Chipnet Electrum server doesn't reliably return token data in UTXOs,
+    // so we build the UTXO object ourselves since we know exactly what we funded.
+    let fundingTxId: string;
     try {
-        const balance = await wallet.getBalance('sat');
-        if (balance < 10000) { // Need more for fees and swap
+        const balance = await wallet.getBalance();
+        if (balance < 10000) {
             throw new Error(`Insufficient BCH balance (${balance}). Need ~10000.`);
         }
 
-        // Check if contract already funded to avoid wasting tokens?
-        // For E2E test, we assume fresh run or we just fund again.
-        // But verify if we have tokens.
-
-        const { txId } = await wallet.send([
+        const result = await wallet.send([
             {
-                cashaddr: contract.address,
+                cashaddr: contract.tokenAddress,
                 value: 1000,
                 unit: 'sat',
-                token: {
-                    category: categoryId,
-                    amount: fundAmount
-                }
+                category: categoryId,
+                amount: fundAmount
             }
         ] as any);
-        console.log(`Funded! TXID: ${txId}`);
-        console.log(`Waiting for confirmation/indexing...`);
-        await new Promise(r => setTimeout(r, 5000)); // Wait 5s
+        fundingTxId = result.txId ?? '';
+        console.log(`Funded! TXID: ${fundingTxId}`);
+        console.log(`Waiting for confirmation...`);
+        await new Promise(r => setTimeout(r, 5000));
     } catch (e) {
         console.error("Funding failed:", e);
         return;
     }
 
-    // 6. Fill the Order
-    console.log("\n--- Attempting Fill (Self-Swap) ---");
-    const resolverPk = await wallet.getPublicKey();
+    // Construct UTXO from the known funding TX
+    // To find the correct `vout`, we decode the raw TX and find the output sent to the token address
+    // with the correct category ID.
+    const rawTx = await provider.getRawTransaction(fundingTxId);
+    const libauthTx = decodeTransaction(hexToBin(rawTx));
+    if (typeof libauthTx === 'string') throw new Error("Failed to decode funding TX");
 
-    // Get Contract UTXOs
-    const contractUtxos = await contract.getUtxos();
-    if (contractUtxos.length === 0) {
-        console.error("No UTXOs found on contract. Funding might have failed or not indexed.");
-        return;
+    // contract.tokenAddress uses P2SH20 locking script
+    const contractLocking = cashAddressToLockingBytecode(contract.tokenAddress);
+    if (typeof contractLocking === 'string') throw new Error(contractLocking);
+    const contractLockingHex = binToHex(contractLocking.bytecode);
+
+    const tokenOutputIndex = libauthTx.outputs.findIndex((o: any) =>
+        binToHex(o.lockingBytecode) === contractLockingHex &&
+        o.token && binToHex(o.token.category) === categoryId
+    );
+
+    if (tokenOutputIndex === -1) {
+        throw new Error("Funding TX did not include the token! Wallet may not have the token balance.");
     }
-    console.log(`Found ${contractUtxos.length} contract UTXOs.`);
 
-    // Manually inject token data if missing (due to indexing lag)
-    // We assume the first UTXO is the one we just sent if it has 1000 sats
-    const utxo = contractUtxos[0];
-    if (!utxo.token && utxo.satoshis === 1000n) {
-        console.log("Injecting token data manually...");
-        utxo.token = {
+    const utxo = {
+        txid: fundingTxId,
+        vout: tokenOutputIndex,
+        satoshis: 1000n,
+        token: {
             amount: fundAmount,
-            category: categoryId
-        };
-    }
+            category: categoryId,
+        },
+    };
 
     console.log("Using UTXO:", JSON.stringify(utxo, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2));
 
-    // Get Wallet UTXOs for paying price + fees
-    console.log("Fetching wallet UTXOs...");
-    const walletUtxosMainnet = await wallet.getUtxos();
-    const walletUtxos = walletUtxosMainnet.map((u: any) => ({
-        txid: u.txid,
-        vout: u.vout,
-        satoshis: BigInt(u.satoshis),
-        // We don't need token info for wallet inputs unless we are spending tokens
-        // But we are spending BCH.
-    }));
-    console.log(`Found ${walletUtxos.length} wallet UTXOs.`);
+    // Get Wallet UTXOs for paying the buy price + fees
+    const walletUtxos = await provider.getUtxos(userAddr);
+    console.log(`Found ${walletUtxos.length} wallet UTXOs via provider.`);
+
+    if (walletUtxos.length === 0) {
+        console.error("No wallet UTXOs found. Cannot pay for the swap.");
+        return;
+    }
 
     try {
-        const signature = new SignatureTemplate(wallet.privateKey);
+        const sigTemplate = new SignatureTemplate(walletData.wif);
 
-        const tx = await contract.functions
-            .fill(resolverPk, signature)
-            .to(userAddr, 5000n) // Output 0: Pay Maker (wallet) 5000 sats (Price)
-            .to(tokenAddr, 1000n, { // Output 1: Pay Resolver tokens
+        // Build the transaction using CashScript v0.12 TransactionBuilder
+        const txBuilder = new TransactionBuilder({ provider });
+
+        // Input 0: The contract UTXO (sell tokens locked in covenant)
+        // Unlocked via contract.unlock.fill(resolverPk, resolverSig)
+        const resolverPk = await wallet.getPublicKey();
+        txBuilder.addInput(utxo, contract.unlock.fill(resolverPk, sigTemplate));
+
+        // Let's assume some time passed to demonstrate Auction Decay
+        const currentLocktime = Math.floor(Date.now() / 1000) + 120; // 2 minutes later
+
+        let targetBuyAmount = safeStartBuyAmount;
+        const elapsed = BigInt(currentLocktime) - startTime;
+        if (elapsed > 0n) {
+            const priceDrop = safeStartBuyAmount - safeEndBuyAmount;
+            const dropAmount = (priceDrop * elapsed) / duration;
+            targetBuyAmount = safeStartBuyAmount - dropAmount;
+        }
+
+        console.log(`Target Dutch Auction Price at T+${elapsed}s: ${targetBuyAmount} sats`);
+
+        // Input 1+: Wallet UTXOs to pay the buy price + fees
+        // Pick enough UTXOs to cover the target price + fees + change difference
+        let totalWalletInput = 0n;
+        const neededSats = targetBuyAmount + 2000n; // price + fees + change dust
+        for (const wUtxo of walletUtxos) {
+            if (totalWalletInput >= neededSats) break;
+            // Skip token UTXOs - only use pure BCH
+            if (wUtxo.token) continue;
+            txBuilder.addInput(wUtxo, sigTemplate.unlockP2PKH());
+            totalWalletInput += wUtxo.satoshis;
+        }
+        console.log(`Total wallet input: ${totalWalletInput} sats`);
+
+        // Output 0: Pay the maker (ourselves) >= targetPrice in BCH
+        txBuilder.addOutput({
+            to: userAddr,
+            amount: targetBuyAmount,
+        });
+
+        // Output 1: Send sell tokens to the resolver (ourselves)
+        // The on-chain contract checks: require(tx.outputs[1].lockingBytecode == new LockingBytecodeP2PKH(hash160(resolverPk)))
+        // CashScript SDK blocks sending tokens to q-prefix addresses, so we construct
+        // the raw P2PKH locking bytecode manually and pass it as Uint8Array.
+        // P2PKH locking bytecode: OP_DUP OP_HASH160 <20-byte-pkh> OP_EQUALVERIFY OP_CHECKSIG
+        const resolverPkBytes = typeof resolverPk === 'string' ? Buffer.from(resolverPk, 'hex') : resolverPk;
+        const sha256Hash = createHash('sha256').update(resolverPkBytes).digest();
+        const ripemd160Hash = createHash('ripemd160').update(sha256Hash).digest();
+        const p2pkhLockingBytecode = new Uint8Array([
+            0x76, // OP_DUP
+            0xa9, // OP_HASH160
+            0x14, // Push 20 bytes
+            ...ripemd160Hash,
+            0x88, // OP_EQUALVERIFY
+            0xac, // OP_CHECKSIG
+        ]);
+        console.log(`Output 0 → maker: ${userAddr}`);
+        console.log(`Output 1 → resolver (raw P2PKH): ${ripemd160Hash.toString('hex')}`);
+        txBuilder.addOutput({
+            to: p2pkhLockingBytecode,
+            amount: 1000n, // dust sats
+            token: {
                 amount: fundAmount,
-                category: categoryId
-            })
-            .withHardcodedFee(2000n)
-            .from(contractUtxos)
-            .fromP2PKH(walletUtxos, signature) // Add wallet inputs!
-            .send();
+                category: categoryId,
+            },
+        });
+
+        // Output 2: Change back to wallet (if any)
+        const totalInput = utxo.satoshis + totalWalletInput;
+        const totalOutput = targetBuyAmount + 1000n; // required Output 0 + 1000 dust
+        const fee = 1000n;
+        const change = totalInput - totalOutput - fee;
+        if (change > 546n) {
+            txBuilder.addOutput({
+                to: userAddr,
+                amount: change,
+            });
+        }
+
+        // Set locktime to current time (required for tx.locktime introspection)
+        txBuilder.setLocktime(currentLocktime);
+
+        console.log(`Locktime: ${currentLocktime}`);
+        console.log(`Fee: ${fee} sats`);
+
+        // Send the transaction
+        const tx = await txBuilder.send();
 
         console.log(`\n✅ Swap Complete!`);
         console.log(`Transaction ID: ${tx.txid}`);
         console.log(`Explorer: https://chipnet.chaingraph.cash/tx/${tx.txid}`);
 
-    } catch (e) {
+    } catch (e: any) {
         console.error("Swap failed:", e);
-        if ((e as any).message) console.error("Error Message:", (e as any).message);
-        const logs = (e as any).logs;
-        if (logs) {
-            console.error("Debug Logs:", logs);
-        }
+        if (e.message) console.error("Error Message:", e.message);
+        if (e.logs) console.error("Debug Logs:", e.logs);
     }
 }
 
