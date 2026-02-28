@@ -1,130 +1,83 @@
-# Dutch Auction on BCH: Recursive Covenants & Introspection Opcodes
+# Intents-Swaps: Same-Chain CashToken Smart Contracts
 
-## The Challenge
+[![Reviewers Guide](https://img.shields.io/badge/docs-Reviewers_Guide-blue)](../docs/reviewers-guide/01-protocol-overview.md)
+[![License: All Rights Reserved](https://img.shields.io/badge/License-All%20Rights%20Reserved-red)](#license)
 
-Dutch Auctions require **continuous state tracking** (price vs time). Unlike Ethereum, Bitcoin Cash has no mutable storage — so how do you track a decaying price curve on a UTXO chain?
+This repository contains **Bitcoin Cash (BCH) smart contracts** enabling pure, decentralized Same-Chain Swaps.
 
-## Our Solution
+Unlike Cross-Chain HTLCs, these contracts function entirely natively on the Bitcoin Cash network. They utilize the CashToken upgrade and Introspection opcodes to facilitate intricate trades directly on the UTXO ledger (e.g., swapping native BCH for `MUSD`).
 
-We use two core BCH primitives: **Recursive Covenants** (to encode and pass state) and **Introspection Opcodes** (to verify output conditions at spend-time).
+### Related Repositories
+This is part of the Same-Chain CashToken infrastructure. It works directly in tandem with:
+* **[cashtoken-relayer](../cashtoken-relayer)**: The off-chain Node.js Decentralized Resolver that acts as an arbitrage bot to fill these covenants.
 
----
+## Architecture: Covenants vs AMMs
 
-## 1. Recursive Covenants — State Without Storage
+These contracts use **Recursive Covenants** and **Introspection Opcodes**. Instead of relying on passive liquidity pools (AMMs), Users encode their exact order criteria into a UTXO. Resolvers (via the relayers) match these orders against available market liquidity.
 
-The auction state is encoded directly in the **contract's constructor parameters**, which are baked into its **P2SH address**:
+### 1. Limit Orders (`Swap.cash`)
+Allows a user to lock assets (BCH or a specific CashToken) into a UTXO covenant. The covenant enforces a strict execution price. A Resolver can only spend this UTXO if the spending transaction simultaneously creates an output paying the User the exact requested amount.
 
-```cashscript
-// contracts/DutchAuctionSwap.cash (Lines 14-31)
-contract DutchAuctionSwap(
-    bytes20 makerPkh,          // WHO created the order
-    bytes   sellTokenCategory, // WHAT they're selling
-    bytes   buyTokenCategory,  // WHAT they want
-    int     sellAmount,        // HOW MUCH
-    int     startBuyAmount,    // Starting price (HIGH)
-    int     endBuyAmount,      // Ending price (LOW)
-    int     startTime,         // WHEN auction starts
-    int     duration           // HOW LONG it runs
-)
+### 2. Dutch Auctions (`DutchAuction.cash`)
+
+Dutch Auctions require continuous state tracking (price vs time). Unlike Ethereum, Bitcoin Cash has no mutable storage. We use Recursive Covenants to track a decaying price curve.
+
+```mermaid
+flowchart TD
+    classDef user fill:#2d3748,stroke:#4a5568,color:#fff;
+    classDef contract fill:#276749,stroke:#22543d,color:#fff;
+    classDef resolver fill:#2b6cb0,stroke:#2c5282,color:#fff;
+
+    A(Maker Creates Intent):::user --> B[UTXO Encodes Initial Price + Decay]:::contract
+    B --> C{Time Elapsed}
+    C -- Resolver Polls t=10m --> D[Price: 1000 MUSD]
+    D -- Not Profitable --> C
+    C -- Resolver Polls t=10h --> F[Price: 800 MUSD]:::contract
+    F -- Profitable! --> G(Resolver Fills Order):::resolver
+    G --> H(Maker receives 800 MUSD):::user
+    G --> I(Resolver receives Spread Profit):::resolver
 ```
 
-**Each unique set of parameters generates a unique contract address.** The address itself IS a commitment to the auction state. No mutable storage needed — the state is the covenant.
+## Introspection Magic (How It Works)
 
-### Why "Recursive"?
+CashScript compiles to BCH's native introspection opcodes (`OP_TXLOCKTIME`, `OP_OUTPUTBYTECODE`, `OP_OUTPUTTOKENAMOUNT`, etc.). These let the covenant inspect the spending transaction to enforce rules entirely on-chain without oracles.
 
-The covenant enforces spending conditions that **reference its own state**. The contract's constructor params define the price curve, and the `fill()` function recomputes the price from those same params at execution time. The state is "passed forward" through the deterministic relationship between constructor args → address → spending script.
+*   `tx.locktime`: The covenant reads current time for the Dutch Auction price decay curve.
+*   `tx.outputs[].tokenCategory`: Verifies WHAT token the user is paid (e.g., MUSD).
+*   `tx.outputs[].tokenAmount`: Verifies EXACTLY HOW MUCH the user receives based on the curve.
 
----
+If the Resolver constructs an invalid payload (e.g., taking the BCH without giving the MUSD), the transaction fails at the hardware level.
 
-## 2. Introspection Opcodes — On-Chain Verification
+## 🛠️ Installation & Testing
 
-CashScript compiles to BCH's native **introspection opcodes** (`OP_TXLOCKTIME`, `OP_OUTPUTBYTECODE`, `OP_OUTPUTTOKENAMOUNT`, etc.). These let the covenant **inspect the spending transaction** to enforce rules:
+1. **Install Dependencies**
+   ```bash
+   npm install
+   ```
 
-### a) Time-Based Price Calculation
+2. **Run the Test Suite**
+   We use `cashscript` alongside `ElectrumNetworkProvider` to run tests locally against Chipnet.
+   ```bash
+   npm test
+   ```
 
-```cashscript
-// DutchAuctionSwap.cash (Lines 46-58)
-int currentTime = tx.locktime;  // OP_TXLOCKTIME — reads tx nLockTime
-require(currentTime >= startTime);
+Our test suite validates:
+* Compilation & Instantiation
+* Dutch Auction Math (Linear Decay correctness)
+* Address Determinism
+* Full Swap Lifecycle (End-to-End)
 
-// Linear decay: price drops from startBuyAmount → endBuyAmount over duration
-int elapsed = currentTime - startTime;
-int clampedElapsed = min(elapsed, duration);
-int priceDrop = startBuyAmount - endBuyAmount;
-int dropAmount = (priceDrop * clampedElapsed) / duration;
-int currentPrice = startBuyAmount - dropAmount;
-```
+## Future-Proofing (2026 Upgrades)
 
-`tx.locktime` is the key introspection opcode here — it lets the contract read the **transaction's locktime field** as a proxy for "current time", enabling the Dutch Auction price curve to decay on-chain.
+While the current MVP successfully utilizes 2023 Introspection to execute linear logic, building advanced DeFi requires iterative mathematics. The upcoming **2026 BCH VM Upgrades** introduce **Bounded Loops (`OP_BEGIN` / `OP_UNTIL`)**.
 
-### b) Output Verification (Covenant Enforcement)
-
-```cashscript
-// DutchAuctionSwap.cash (Lines 63-90)
-
-// Output 0: Verify maker receives >= currentPrice of buy tokens
-require(tx.outputs[0].lockingBytecode == makerLockingBytecode);  // OP_OUTPUTBYTECODE
-require(tx.outputs[0].tokenCategory == buyTokenCategory);        // OP_OUTPUTTOKENCATEGORY
-require(tx.outputs[0].tokenAmount >= currentPrice);              // OP_OUTPUTTOKENAMOUNT
-
-// Output 1: Verify resolver receives sell tokens
-require(tx.outputs[1].lockingBytecode == resolverLockingBytecode);
-require(tx.outputs[1].tokenCategory == sellTokenCategory);
-require(tx.outputs[1].tokenAmount >= sellAmount);
-```
-
-These introspection opcodes let the covenant verify:
-- **WHO** gets paid (locking bytecode check)
-- **WHAT** token they receive (category check)
-- **HOW MUCH** they receive (amount check)
-
-All enforced at the **Bitcoin Script level** — no trusted third party.
+Currently, Dutch Auction pricing is constrained to linear decay. The introduction of bounded loops will allow us to implement non-linear execution—such as advanced AMM models or exponential time-decay curves—directly on-chain using iterative approximations (like Taylor series) within these covenants.
 
 ---
 
-## 3. Deployment — Little-Endian Awareness
+## 📜 License
 
-```typescript
-// tools/deploy_long_auction.ts (Lines 135-149)
-const reverseHex = (hex: string) => hex.match(/.{2}/g)!.reverse().join('');
+**Copyright (c) 2026 Intents-Swaps. All Rights Reserved.**
+This software and associated documentation files are proprietary and confidential. No part of this repository may be copied, reproduced, distributed, or modified without explicit written permission.
 
-const contract = new Contract(artifact, [
-    makerPkh,
-    `0x${reverseHex(categoryId)}`,  // Reverse to Little-Endian for introspection
-    buyTokenCategory,
-    sellAmount, startBuyAmount, endBuyAmount,
-    startTime, duration
-], { provider });
-```
-
-We reverse the token category ID to **Little-Endian** because BCH introspection opcodes return data in wire format. This ensures `tx.outputs[].tokenCategory` matches correctly during covenant verification.
-
----
-
-## 4. Test Validation
-
-Our test suite ([DutchAuctionSwap.test.ts](test/DutchAuctionSwap.test.ts)) validates:
-
-| Test | What It Proves |
-|------|---------------|
-| **Compilation & Instantiation** | Contract compiles and deploys to Chipnet |
-| **Dutch Auction Math** | Price decays correctly at 0%, 25%, 50%, 75%, 100% elapsed |
-| **Address Determinism** | Same params → same address (covenant state commitment) |
-| **Full Swap Lifecycle** | End-to-end: fund → fill → settle |
-
----
-
-## Summary
-
-| Technique | Where | Purpose |
-|-----------|-------|---------|
-| **Recursive Covenant** | Constructor params (L14-31) | Encode auction state in contract address |
-| `tx.locktime` | Price calc (L46) | Read "current time" for Dutch Auction curve |
-| `tx.outputs[].lockingBytecode` | Output check (L64, L81) | Verify WHO gets paid |
-| `tx.outputs[].tokenCategory` | Output check (L72, L88) | Verify WHAT token is paid |
-| `tx.outputs[].tokenAmount` | Output check (L73, L89) | Verify HOW MUCH is paid |
-| `tx.outputs[].value` | Output check (L69, L75, L85) | Verify BCH amounts |
-| `tx.time` | Cancel guard (L103) | Enforce timelock for cancellation |
-| Little-Endian reversal | Deployment (L135) | Match introspection wire format |
-
-> **TL;DR:** The covenant IS the state. Constructor params define the price curve, `tx.locktime` provides the clock, and output introspection enforces correctness. No oracles, no storage, no trust — just Bitcoin Script.
+*Part of the Intents Swap Protocol Ecosystem — Bringing Intent-based DeFi to Bitcoin Cash.*
