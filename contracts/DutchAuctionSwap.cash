@@ -40,9 +40,15 @@ contract DutchAuctionSwap(
         // Verify resolver's signature
         require(checkSig(resolverSig, resolverPk));
 
+        // Prevent 3rd-party UTXO drain: only covenant + resolver inputs allowed
+        require(tx.inputs.length == 2);
+
         // --- Dutch Auction Price Calculation ---
         // Use tx.locktime as the "current time" for the auction
         int currentTime = tx.locktime;
+
+        // Enforce unix timestamp interpretation (not block number)
+        require(currentTime >= 500000000);
 
         // Must be after auction start
         require(currentTime >= startTime);

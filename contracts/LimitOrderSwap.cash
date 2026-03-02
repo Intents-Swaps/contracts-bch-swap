@@ -28,8 +28,15 @@ contract LimitOrderSwap(
         // Verify resolver's signature
         require(checkSig(resolverSig, resolverPk));
 
+        // Prevent 3rd-party UTXO drain: only covenant + resolver inputs allowed
+        require(tx.inputs.length == 2);
+
         // Must be before expiry
         int currentTime = tx.locktime;
+
+        // Enforce unix timestamp interpretation (not block number)
+        require(currentTime >= 500000000);
+
         require(currentTime < expiryTime);
 
         // --- Covenant: Enforce output constraints ---
